@@ -1,0 +1,15 @@
+[Unit]
+Description=Keyboard Guard: turns the laptop keyboard on or off
+Before=display-manager.service
+
+[Service]
+ExecStart=/usr/local/lib/keyboard-guard/kbguardd.py --user @USER@
+# Hands the keyboard back even if the service was killed without cleaning up.
+ExecStopPost=/usr/local/lib/keyboard-guard/kbguardd.py --release
+Restart=on-failure
+RestartSec=1
+RuntimeDirectory=keyboard-guard
+StateDirectory=keyboard-guard
+
+[Install]
+WantedBy=multi-user.target

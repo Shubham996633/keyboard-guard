@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Keyboard Guard
+Comment=Turn the laptop keyboard on or off
+Exec=/usr/local/lib/keyboard-guard/kbguard-tray.py
+Icon=/usr/local/lib/keyboard-guard/icons/keyboard-on.svg
+Terminal=false
+Categories=Settings;HardwareSettings;
+StartupWMClass=local.KeyboardGuard
+X-GNOME-Autostart-enabled=true
