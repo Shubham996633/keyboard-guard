@@ -9,11 +9,15 @@ Modes:
   off   laptop keyboard is always off
   on    laptop keyboard is always on
 
+The laptop keyboard can also be turned on for a set number of minutes, and
+external devices can be ignored so they don't count as a keyboard in auto mode.
+
 The tray app talks to this service over a Unix socket that only one user can open.
 """
 import argparse
 import glob
 import json
+import math
 import os
 import pwd
 import select
@@ -40,6 +44,9 @@ LETTER_KEYS = list(range(16, 26)) + list(range(30, 39)) + list(range(44, 51))
 RESCAN_SECONDS = 5  # fallback in case a hotplug event is missed
 SETTLE_SECONDS = 0.5  # let a burst of hotplug events finish before rescanning
 NETLINK_KOBJECT_UEVENT = 15
+MAX_TEMPORARY_MINUTES = 120
+MAX_IGNORED = 32
+MAX_NAME_LENGTH = 256
 
 
 def log(message):
@@ -112,36 +119,81 @@ def should_disable_internal(mode, keyboards):
         return True
     if mode == "on":
         return False
-    return any(keyboard["kind"] == "external" for keyboard in keyboards)
+    return any(keyboard["kind"] == "external" and not keyboard.get("ignored")
+               for keyboard in keyboards)
+
+
+def boot_clock():
+    """Seconds since boot, including suspend, so a timer can't stretch across sleep."""
+    return time.clock_gettime(time.CLOCK_BOOTTIME)
 
 
 class Guard:
-    def __init__(self, sysfs, state_path):
+    def __init__(self, sysfs, state_path, clock=boot_clock):
         self.sysfs = sysfs
         self.state_path = state_path
-        self.mode = self.load_mode()
+        self.clock = clock
+        self.mode = "auto"
+        self.ignored = []
+        self.on_until = None  # end of a "turn on for a while"; deliberately not saved
         self.error = ""
+        self.load_state()
 
-    def load_mode(self):
+    def load_state(self):
         try:
             with open(self.state_path) as handle:
-                mode = json.load(handle).get("mode")
-            if mode in MODES:
-                return mode
+                state = json.load(handle)
+            if state.get("mode") in MODES:
+                self.mode = state["mode"]
+            ignored = state.get("ignored", [])
+            if isinstance(ignored, list):
+                self.ignored = [name for name in ignored if isinstance(name, str)][:MAX_IGNORED]
         except (OSError, ValueError, AttributeError):
             pass
-        return "auto"
 
-    def save_mode(self):
+    def save_state(self):
         temporary = self.state_path + ".tmp"
         with open(temporary, "w") as handle:
-            json.dump({"mode": self.mode}, handle)
+            json.dump({"mode": self.mode, "ignored": self.ignored}, handle)
         os.replace(temporary, self.state_path)
 
     def set_mode(self, mode):
         self.mode = mode
-        self.save_mode()
+        self.on_until = None
+        self.save_state()
         self.apply()
+
+    def turn_on_for(self, minutes):
+        self.on_until = self.clock() + minutes * 60
+        self.apply()
+
+    def cancel_temporary(self):
+        self.on_until = None
+        self.apply()
+
+    def temporary_minutes_left(self):
+        if self.on_until is None:
+            return 0
+        left = self.on_until - self.clock()
+        if left <= 0:
+            self.on_until = None
+            return 0
+        return math.ceil(left / 60)
+
+    def set_ignored(self, name, ignored):
+        """Return an error message, or '' on success."""
+        if ignored and name not in self.ignored:
+            external = [k["name"] for k in scan_keyboards(self.sysfs) if k["kind"] == "external"]
+            if name not in external:
+                return "not a connected external keyboard"
+            if len(self.ignored) >= MAX_IGNORED:
+                return "too many ignored devices"
+            self.ignored.append(name)
+        elif not ignored and name in self.ignored:
+            self.ignored.remove(name)
+        self.save_state()
+        self.apply()
+        return ""
 
     def write_inhibit(self, keyboard, disabled):
         if keyboard["disabled"] == disabled:
@@ -158,7 +210,10 @@ class Guard:
     def apply(self):
         """Make the hardware match the mode. External keyboards are never touched."""
         keyboards = scan_keyboards(self.sysfs)
-        disable = should_disable_internal(self.mode, keyboards)
+        for keyboard in keyboards:
+            keyboard["ignored"] = keyboard["kind"] == "external" and keyboard["name"] in self.ignored
+        disable = (should_disable_internal(self.mode, keyboards)
+                   and self.temporary_minutes_left() == 0)
         self.error = ""
         for keyboard in keyboards:
             if keyboard["kind"] == "internal":
@@ -175,6 +230,7 @@ class Guard:
         return {
             "mode": self.mode,
             "error": self.error,
+            "temporary_minutes_left": self.temporary_minutes_left(),
             "keyboards": [
                 {key: value for key, value in keyboard.items() if not key.startswith("_")}
                 for keyboard in keyboards
@@ -192,6 +248,22 @@ def handle_request(guard, raw):
         if request.get("mode") not in MODES:
             return {"error": "unknown mode"}
         guard.set_mode(request["mode"])
+    elif command == "turn_on_for":
+        minutes = request.get("minutes")
+        if type(minutes) is not int or not 1 <= minutes <= MAX_TEMPORARY_MINUTES:
+            return {"error": "bad minutes"}
+        guard.turn_on_for(minutes)
+    elif command == "cancel_temporary":
+        guard.cancel_temporary()
+    elif command == "set_ignored":
+        name = request.get("name")
+        ignored = request.get("ignored")
+        if not isinstance(name, str) or not 0 < len(name) <= MAX_NAME_LENGTH \
+                or not isinstance(ignored, bool):
+            return {"error": "bad device"}
+        problem = guard.set_ignored(name, ignored)
+        if problem:
+            return {"error": problem}
     elif command != "status":
         return {"error": "unknown command"}
     return guard.status()
