@@ -12,8 +12,15 @@ import sys
 import gi
 
 gi.require_version("Gtk", "3.0")
-gi.require_version("AppIndicator3", "0.1")
-from gi.repository import AppIndicator3, GdkPixbuf, Gio, GLib, Gtk  # noqa: E402
+from gi.repository import GdkPixbuf, Gio, GLib, Gtk  # noqa: E402
+
+# Distros ship one of these two libraries, and they work the same way.
+try:
+    gi.require_version("AyatanaAppIndicator3", "0.1")
+    from gi.repository import AyatanaAppIndicator3 as AppIndicator3  # noqa: E402
+except (ValueError, ImportError):
+    gi.require_version("AppIndicator3", "0.1")
+    from gi.repository import AppIndicator3  # noqa: E402
 
 APP_ID = "local.KeyboardGuard"
 SOCKET_PATH = os.environ.get("KBGUARD_SOCKET", "/run/keyboard-guard/control.sock")

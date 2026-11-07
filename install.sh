@@ -13,6 +13,22 @@ if [ -z "${SUDO_USER:-}" ] || [ "$SUDO_USER" = "root" ]; then
     exit 1
 fi
 
+if ! ls /sys/class/input/input*/inhibited >/dev/null 2>&1; then
+    echo "This kernel can't switch input devices off. Keyboard Guard needs Linux 5.11 or newer." >&2
+    exit 1
+fi
+if ! python3 -c '
+import gi
+gi.require_version("Gtk", "3.0")
+try:
+    gi.require_version("AyatanaAppIndicator3", "0.1")
+except ValueError:
+    gi.require_version("AppIndicator3", "0.1")
+' 2>/dev/null; then
+    echo "Warning: the tray and window need PyGObject, GTK 3 and an AppIndicator library." >&2
+    echo "On Debian/Ubuntu: sudo apt install python3-gi gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1" >&2
+fi
+
 source_dir=$(dirname "$(readlink -f "$0")")
 lib=/usr/local/lib/keyboard-guard
 
