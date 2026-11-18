@@ -7,11 +7,13 @@ Only one copy runs: starting it again opens the window of the running copy.
 import json
 import os
 import socket
+import subprocess
 import sys
 
 import gi
 
 gi.require_version("Gtk", "3.0")
+gi.require_version("GdkPixbuf", "2.0")
 from gi.repository import GdkPixbuf, Gio, GLib, Gtk  # noqa: E402
 
 # Distros ship one of these two libraries, and they work the same way.
@@ -28,6 +30,7 @@ HERE = os.path.dirname(os.path.realpath(__file__))
 ICON_ON = os.path.join(HERE, "icons", "keyboard-on.svg")
 ICON_OFF = os.path.join(HERE, "icons", "keyboard-off.svg")
 REFRESH_SECONDS = 2
+TEMPORARY_MINUTES = 10
 SERVICE_DOWN = "Keyboard Guard service is not running"
 NO_EXTERNAL_WARNING = "No external keyboard: use the touchpad to turn it back on"
 
@@ -71,13 +74,34 @@ def summarize(status):
     if not service_is_up(status):
         return ICON_ON, SERVICE_DOWN, ""
     internal, external = split_keyboards(status)
-    if internal and all(k["disabled"] for k in internal):
+    if laptop_keyboard_off(status):
         return ICON_OFF, "Laptop keyboard is OFF", "" if external else NO_EXTERNAL_WARNING
+    minutes = status.get("temporary_minutes_left", 0)
+    if minutes:
+        unit = "minute" if minutes == 1 else "minutes"
+        return ICON_ON, f"Laptop keyboard is ON for {minutes} more {unit}", ""
     return ICON_ON, "Laptop keyboard is ON", ""
 
 
+def laptop_keyboard_off(status):
+    internal, _external = split_keyboards(status)
+    return bool(internal) and all(k["disabled"] for k in internal)
+
+
+def temporary_action(status):
+    """The timer action that makes sense now, as (label, request), or None."""
+    if status.get("temporary_minutes_left", 0):
+        return "Turn it back off now", {"cmd": "cancel_temporary"}
+    if laptop_keyboard_off(status):
+        return (f"Turn on for {TEMPORARY_MINUTES} minutes",
+                {"cmd": "turn_on_for", "minutes": TEMPORARY_MINUTES})
+    return None
+
+
 def keyboard_kind_label(keyboard):
-    return "Laptop" if keyboard["kind"] == "internal" else "External"
+    if keyboard["kind"] == "internal":
+        return "Laptop"
+    return "External, ignored" if keyboard.get("ignored") else "External"
 
 
 def keyboard_state_label(keyboard):
@@ -122,6 +146,11 @@ class Tray:
         if service_is_up(status):
             if status.get("error"):
                 menu.append(label_item(status["error"]))
+            action = temporary_action(status)
+            if action:
+                item = Gtk.MenuItem(label=action[0])
+                item.connect("activate", lambda _item: self.app.send(action[1]))
+                menu.append(item)
             self.add_mode_items(menu, status)
             self.add_keyboard_items(menu, status)
 
@@ -191,6 +220,12 @@ class Window(Gtk.ApplicationWindow):
         summary.pack_start(summary_text, True, True, 0)
         page.pack_start(summary, False, False, 6)
 
+        self.temporary_button = Gtk.Button()
+        self.temporary_button.set_no_show_all(True)
+        self.temporary_button.connect("clicked", self.on_temporary_clicked)
+        self.temporary_request = None
+        page.pack_start(self.temporary_button, False, False, 0)
+
         self.mode_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         self.mode_box.pack_start(section_title("Mode"), False, False, 0)
         self.radios = {}
@@ -225,6 +260,11 @@ class Window(Gtk.ApplicationWindow):
 
         up = service_is_up(status)
         self.mode_box.set_sensitive(up)
+        action = temporary_action(status) if up else None
+        self.temporary_button.set_visible(bool(action))
+        if action:
+            self.temporary_button.set_label(action[0])
+            self.temporary_request = action[1]
         if up:
             self.showing_status = True
             self.radios[status["mode"]].set_active(True)
@@ -243,6 +283,14 @@ class Window(Gtk.ApplicationWindow):
             text.pack_start(left_label(keyboard_kind_label(keyboard), "dim-label"), False, False, 0)
             row.pack_start(text, True, True, 0)
             row.pack_end(Gtk.Label(label=keyboard_state_label(keyboard)), False, False, 0)
+            if keyboard["kind"] == "external":
+                ignore = Gtk.CheckButton(label="Ignore")
+                ignore.set_tooltip_text(
+                    "Don't count this device as a keyboard, for example a security key")
+                ignore.set_active(keyboard.get("ignored", False))
+                # Connected after set_active so that drawing the row changes nothing.
+                ignore.connect("toggled", self.on_ignore_toggled, keyboard["name"])
+                row.pack_end(ignore, False, False, 0)
             self.keyboard_list.add(row)
         if not internal + external:
             empty = left_label("None found", "dim-label")
@@ -256,6 +304,14 @@ class Window(Gtk.ApplicationWindow):
         if radio.get_active() and not self.showing_status:
             GLib.idle_add(self.app.set_mode, mode)
 
+    def on_temporary_clicked(self, _button):
+        if self.temporary_request:
+            self.app.send(self.temporary_request)
+
+    def on_ignore_toggled(self, check, name):
+        # Deferred: the reply rebuilds the list, which destroys this very button.
+        GLib.idle_add(self.app.send, {"cmd": "set_ignored", "name": name, "ignored": check.get_active()})
+
 
 class App(Gtk.Application):
     def __init__(self):
@@ -263,6 +319,8 @@ class App(Gtk.Application):
         self.tray = None
         self.window = None
         self.last_status = object()
+        self.announced_off = None
+        self.previous_off = None
 
     def do_startup(self):
         Gtk.Application.do_startup(self)
@@ -290,10 +348,36 @@ class App(Gtk.Application):
             self.tray.show(status)
             if self.window:
                 self.window.show_status(status)
+        self.announce_change(status)
         return True
 
+    def announce_change(self, status):
+        """Popup when the keyboard flips. It must hold for two checks, so a USB
+        blip while resuming from sleep doesn't produce a pair of popups."""
+        if not service_is_up(status):
+            return
+        off = laptop_keyboard_off(status)
+        if self.announced_off is None:
+            self.announced_off = off  # what it was when the app started is not news
+        elif off != self.announced_off and off == self.previous_off:
+            self.announced_off = off
+            self.notify(off)
+        self.previous_off = off
+
+    def notify(self, off):
+        title = "Laptop keyboard is off" if off else "Laptop keyboard is on"
+        try:
+            subprocess.Popen(
+                ["notify-send", "-a", "Keyboard Guard", "-i", ICON_OFF if off else ICON_ON, title],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError:
+            pass
+
     def set_mode(self, mode):
-        ask_service({"cmd": "set_mode", "mode": mode})
+        return self.send({"cmd": "set_mode", "mode": mode})
+
+    def send(self, request):
+        ask_service(request)
         self.refresh()
         return False
 

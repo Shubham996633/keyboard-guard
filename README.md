@@ -14,6 +14,9 @@ choice survives a reboot.
 |---|---|
 | **Auto mode** | The laptop keyboard is off while an external keyboard is connected, and comes back when you unplug it. This is the default. |
 | **Always off / Always on** | Stays the way you set it, whatever is plugged in. |
+| **Turn on for 10 minutes** | Need the laptop keyboard for a moment? It turns on, then goes back off by itself. |
+| **Ignore list** | Stop a security key or barcode scanner from counting as a keyboard. Tick **Ignore** in the app window. |
+| **Popups** | A notification tells you when the laptop keyboard turns off or on. |
 | **Tray icon** | Green when the laptop keyboard is on, red when it is off. Switch modes from the menu. |
 | **App window** | Shows the current state, the mode and every detected keyboard. |
 | **No password to switch** | After installing, the user who installed it can change modes without sudo. |
@@ -70,7 +73,9 @@ the laptop keyboard back on, run `sudo ./uninstall.sh`.
   login screen. Use the on-screen keyboard from the accessibility menu.
 - **Disk encryption passwords and the boot menu are not covered.** The service starts after
   them, so the laptop keyboard still works there, and a faulty one can still interfere.
-- **Barcode scanners and security keys** that act as USB keyboards count as external.
+- **Barcode scanners and security keys** that act as USB keyboards count as external until you
+  tick **Ignore** for them in the app window. Devices are matched by name, so this also ignores
+  another device with the same name.
 
 ## If you get stuck
 
@@ -94,8 +99,8 @@ built-in keyboard. It watches for devices being plugged in or removed, and keeps
 `/var/lib/keyboard-guard/state.json`.
 
 `kbguard-tray.py` is the tray icon and window. It runs as your user and talks to the service
-over a Unix socket that only the installing user can open. It can only ask for the status or
-change the mode.
+over a Unix socket that only the installing user can open. It can only ask for the status,
+change the mode, start or cancel the timer, and change the ignore list.
 
 Run the tests with `python3 test_kbguard.py`. They use a fake device tree, so they need no root
 and don't touch your hardware.
